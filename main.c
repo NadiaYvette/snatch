@@ -231,11 +231,12 @@ int main(int argc, char *argv[])
 					j, fdlist[j]->d_name);
 		strcat(path, "/");
 		strcat(path, fdlist[0]->d_name);
-		if (nr_fds > 1) {
+		if (nr_fds == 1)
+			ret = copy_data(path, argv[1]);
+		else {
 			dprintf("Non-unique match for MPEG fd!\n");
 			return EX_OSFILE;
-		} else
-			ret = copy_data(path, argv[1]);
+		}
 	}
 	return ret;
 }
