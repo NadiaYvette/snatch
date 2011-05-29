@@ -11,18 +11,8 @@
 #include <sysexits.h>
 #include <time.h>
 #include <unistd.h>
+#include "debug.h"
 
-#ifdef DEBUG
-#define dprintf(fmt, args...)					\
-	do {							\
-		fprintf(stderr, "%s:%d: " fmt,			\
-			__FILE__, __LINE__, ##args);		\
-	} while (0)
-#else /* !defined(DEBUG) */
-#define dprintf(fmt, args...)					\
-	do {							\
-	} while (0)
-#endif /* !defined(DEBUG) */
 /*
  * Ugly, passing over the head of things.
  */
@@ -85,7 +75,6 @@ int get_pid_max(void)
 {
 	/* vastly in excess of what's known to reside in-kernel */
 	char buf[256], *endptr = NULL;
-	struct stat stat_buf;
 	ssize_t read_ret;
 	int fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
 
@@ -105,8 +94,7 @@ int get_pid_max(void)
 		return -1;
 	}
 	pid_max = strtol(buf, &endptr, 10);
-	if (endptr == buf || endptr - buf < stat_buf.st_size
-				|| pid_max <= 0 || errno) {
+	if (endptr == buf || pid_max <= 0 || errno) {
 		dprintf("Malformatted numeral, endptr - buf = %zd.\n",
 						endptr - buf);
 		dprintf("read_ret = %zd\n", read_ret);
@@ -118,11 +106,99 @@ int get_pid_max(void)
 	return 0;
 }
 
+static int copy_data(const char *src, const char *dst)
+{
+	int in_fd, out_fd, size_same = 0, ret = EX_OK;
+	char *tmp, *buf = NULL;
+	size_t buf_size = 0, size_diff, left;
+	struct stat in_stat, out_stat;
+
+	if ((in_fd = open(src, O_RDONLY)) < 0) {
+		ret = EX_UNAVAILABLE;
+		goto out;
+	}
+	if ((out_fd = open(dst, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP)) < 0) {
+		ret = EX_UNAVAILABLE;
+		goto out;
+	}
+	while (size_same <= 2) {
+		struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
+
+		if (fstat(out_fd, &out_stat))
+			return EX_OSERR;
+		if (fstat(in_fd, &in_stat))
+			return EX_OSERR;
+		if (in_stat.st_size == out_stat.st_size) {
+			size_same++;
+			goto sleep;
+		}
+		size_same = 0;
+		if (out_stat.st_size > in_stat.st_size) {
+sleep:
+			nanosleep(&req, NULL);
+			continue;
+		}
+		if (lseek(in_fd, out_stat.st_size, SEEK_SET) != out_stat.st_size) {
+			ret = EX_OSERR;
+			goto out_free;
+		}
+		if (lseek(out_fd, out_stat.st_size, SEEK_SET) != out_stat.st_size) {
+			ret = EX_OSERR;
+			goto out_free;
+		}
+		size_diff = in_stat.st_size - out_stat.st_size;
+		if (buf_size < size_diff) {
+			if (!(tmp = realloc(buf, size_diff))) {
+				ret = EX_OSERR;
+				goto out_free;
+			}
+			buf = tmp;
+			buf_size = size_diff;
+		}
+		left = size_diff;
+		while (left > 0) {
+			ssize_t read_ret, write_ret;
+			size_t write_left;
+
+			read_ret = read(in_fd, buf, left);
+			if (read_ret < 0) {
+				ret = EX_OSERR;
+				goto out_free;
+			} else if (!read_ret) {
+				if (errno && errno != EAGAIN) {
+					ret = EX_OSERR;
+					goto out_free;
+				}
+				goto sleep;
+			}
+			write_left = read_ret;
+			while (write_left > 0) {
+				write_ret = write(out_fd, buf, write_left);
+				if (write_ret < 0) {
+					ret = EX_OSERR;
+					goto out_free;
+				} else if (!write_ret) {
+					if (errno && errno != EAGAIN) {
+						ret = EX_OSERR;
+						goto out_free;
+					}
+					goto sleep;
+				}
+				write_left -= write_ret;
+			}
+			left -= read_ret;
+		}
+	}
+out_free:
+	free(buf);
+out:
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
 	int i, nr_dirs, ret = EX_OK;
 	struct dirent **proclist = NULL;
-	char *tmp, *buf = NULL;
 
 	if (argc != 2)
 		return EX_USAGE;
@@ -153,96 +229,13 @@ int main(int argc, char *argv[])
 		for (j = 0; j < nr_fds; ++j)
 			dprintf("%s->fd[%d] = %s\n", proclist[i]->d_name,
 					j, fdlist[j]->d_name);
+		strcat(path, "/");
+		strcat(path, fdlist[0]->d_name);
 		if (nr_fds > 1) {
 			dprintf("Non-unique match for MPEG fd!\n");
 			return EX_OSFILE;
-		} else {
-			int in_fd, out_fd, size_same = 0, ret = EX_OK;
-			size_t buf_size = 0, size_diff, left;
-			struct stat in_stat, out_stat;
-			strcat(path, "/");
-			strcat(path, fdlist[0]->d_name);
-			if ((in_fd = open(path, O_RDONLY)) < 0) {
-				ret = EX_UNAVAILABLE;
-				goto out;
-			}
-			if ((out_fd = open(argv[1], O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP)) < 0) {
-				ret = EX_UNAVAILABLE;
-				goto out;
-			}
-			while (size_same <= 2) {
-				struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
-
-				if (fstat(out_fd, &out_stat))
-					return EX_OSERR;
-				if (fstat(in_fd, &in_stat))
-					return EX_OSERR;
-				if (in_stat.st_size == out_stat.st_size) {
-					size_same++;
-					goto sleep;
-				}
-				size_same = 0;
-				if (out_stat.st_size > in_stat.st_size) {
-sleep:
-					nanosleep(&req, NULL);
-					continue;
-				}
-				if (lseek(in_fd, out_stat.st_size, SEEK_SET) != out_stat.st_size) {
-					ret = EX_OSERR;
-					goto out_free;
-				}
-				if (lseek(out_fd, out_stat.st_size, SEEK_SET) != out_stat.st_size) {
-					ret = EX_OSERR;
-					goto out_free;
-				}
-				size_diff = in_stat.st_size - out_stat.st_size;
-				if (buf_size < size_diff) {
-					if (!(tmp = realloc(buf, size_diff))) {
-						ret = EX_OSERR;
-						goto out_free;
-					}
-					buf = tmp;
-					buf_size = size_diff;
-				}
-				left = size_diff;
-				while (left > 0) {
-					ssize_t read_ret, write_ret;
-					size_t write_left;
-
-					read_ret = read(in_fd, buf, left);
-					if (read_ret < 0) {
-						ret = EX_OSERR;
-						goto out_free;
-					} else if (!read_ret) {
-						if (errno && errno != EAGAIN) {
-							ret = EX_OSERR;
-							goto out_free;
-						}
-						goto sleep;
-					}
-					write_left = read_ret;
-					while (write_left > 0) {
-						write_ret = write(out_fd, buf, write_left);
-						if (write_ret < 0) {
-							ret = EX_OSERR;
-							goto out_free;
-						} else if (!write_ret) {
-							if (errno && errno != EAGAIN) {
-								ret = EX_OSERR;
-								goto out_free;
-							}
-							goto sleep;
-						}
-						write_left -= write_ret;
-					}
-					left -= read_ret;
-				}
-			}
-		}
+		} else
+			ret = copy_data(path, argv[1]);
 	}
-	return EX_OK;
-out_free:
-	free(buf);
-out:
 	return ret;
 }
